@@ -1,0 +1,29 @@
+mission:
+  name: lunar_lander_mission
+  stages:
+    descent:
+      dry_mass_kg: 5300.0 
+      wet_mass_kg: 19200.0 
+      isp_s: 339.0
+      thrust_N: 24500.0
+      num_thrusters: 2
+      brake_gain: 0.05
+      target_brake_gain: 0.14 
+      vsink_target_mps: -5.0
+      approach_altitude_m: 2500.0
+      terminal_gain: 1.0
+      k_speed: 0.5
+      max_jerk_mps3: 4.0
+      blend_duration_s: 20.0
+      sim_time_step_s: 0.1
+      print_interval_s: 30.0
+    ascent:
+      dry_mass_kg: 1951.0
+      wet_mass_kg: 9000.0
+      isp_s: 339.0
+      thrust_N: 24500.0
+      num_thrusters: 1
+      sim_time_step_s: 0.1
+      print_interval_s: 30.0
+      max_jerk_mps3: 4.0
+      blend_duration_s: 20.0
