@@ -33,16 +33,21 @@
 #       "both"  - record and stream simultaneously
 #       "off"   - no visualization
 #
-# ============================ CAD MODEL HOOK ============================
-# Custom CAD geometry is plumbed through but OFF by default. When you have
-# a model ready (e.g. exported from Fusion 360 / SolidWorks as .obj with
-# units in meters, +X forward, +Z up), just pass:
-#     lander_cad_path="models/ascent_stage.obj"
-#     orion_cad_path="models/orion.obj"
-# and optionally cad_scale / cad_offset_m / cad_rotation_deg. The hook uses
-# vizSupport.createCustomModel(), so .obj/.stl/.fbx and Unity primitive
-# names ("CUBE", "CYLINDER", "SPHERE", ...) all work. Until then, Vizard's
-# built-in spacecraft model is used. Every viz feature is wrapped
+# ============================= CAD MODELS ==============================
+# Both vehicles fly with CAD geometry, resolved per-vehicle by
+# lander_cad_path / orion_cad_path:
+#   "auto" (default) - use models/ascent_stage.obj and models/orion.obj;
+#                      if missing, they are procedurally generated on the
+#                      spot by generate_cad_models.py (gold-foil ascent
+#                      stage with engine bell/RCS/HGA; Orion capsule +
+#                      service module with X-pattern solar arrays)
+#   a path           - your own CAD export (.obj/.stl/.fbx; e.g. from
+#                      Fusion 360 / SolidWorks: units in meters, +X
+#                      forward, +Z up), or a Unity primitive name
+#                      ("CUBE", "CYLINDER", "SPHERE", ...)
+#   None/"off"       - Vizard's built-in spacecraft model
+# cad_scale / cad_offset_m / cad_rotation_deg adjust the fit. The hook
+# uses vizSupport.createCustomModel(). Every viz feature is wrapped
 # defensively: if your Basilisk build lacks a feature (or vizInterface
 # entirely), the sim still runs and just prints a [viz] note.
 # ========================================================================
@@ -118,6 +123,39 @@ def get_local_radius(r_inertial, t, dem_path):
     lon_deg = np.degrees(np.arctan2(yf, xf))
     radius_m, source = get_surface_radius_m(lat_deg, lon_deg, dem_path)
     return radius_m, lat_deg, lon_deg, source
+
+
+CAD_MODEL_DIR = "models"
+
+
+def resolve_cad_path(path_spec, default_file_name):
+    """Resolve a per-vehicle CAD path spec.
+
+    None / "" / "off" / "none" / "default" -> Vizard's built-in model.
+    "auto" -> models/<default_file_name>, procedurally generating the
+              model set via generate_cad_models.py if it is missing.
+    anything else -> used as-is (.obj/.stl/.fbx path or Unity primitive).
+    """
+    if not path_spec or str(path_spec).lower() in ("off", "none", "default"):
+        return None
+    if str(path_spec).lower() != "auto":
+        return path_spec
+    model_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        CAD_MODEL_DIR,
+    )
+    candidate = os.path.join(model_dir, default_file_name)
+    if not os.path.exists(candidate):
+        try:
+            from generate_cad_models import build_all
+            build_all(model_dir)
+            print(f"[viz] procedural CAD models generated in '{model_dir}'.")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[viz] could not auto-generate CAD models ({exc}); "
+                "using Vizard default geometry."
+            )
+    return candidate if os.path.exists(candidate) else None
 
 
 def build_fallback_state(ascent_mass):
@@ -288,9 +326,9 @@ def run(
     viz_mode="file",          # "file" | "live" | "both" | "off"
     viz_file_name=None,       # defaults to this script's name
     show_orion_target=True,   # add Orion propagating the NRHO for context
-    # ------------- CAD hooks (leave None until models exist) -------------
-    lander_cad_path=None,     # e.g. "models/ascent_stage.obj" or "CYLINDER"
-    orion_cad_path=None,      # e.g. "models/orion.obj"
+    # ------------- CAD models -------------
+    lander_cad_path="auto",   # "auto" | a model path | primitive | None
+    orion_cad_path="auto",    # "auto" | a model path | primitive | None
     cad_scale=1.0,
     cad_offset_m=(0.0, 0.0, 0.0),
     cad_rotation_deg=(0.0, 0.0, 0.0),
@@ -495,6 +533,8 @@ def run(
         sc_sim.AddModelToTask(sim_task_name, orion_recorder)
 
     # --- Vizard scene ------------------------------------------------------
+    lander_cad_path = resolve_cad_path(lander_cad_path, "ascent_stage.obj")
+    orion_cad_path = resolve_cad_path(orion_cad_path, "orion.obj")
     cad_models = []
     if lander_cad_path:
         cad_models.append({
@@ -1031,10 +1071,13 @@ if __name__ == "__main__":
         # ---- visualization ----
         viz_mode="file",              # "file" | "live" | "both" | "off"
         show_orion_target=True,
-        # ---- CAD hooks: uncomment when your models are exported ----
-        # lander_cad_path="models/ascent_stage.obj",
-        # orion_cad_path="models/orion.obj",
-        # cad_scale=1.0,
-        # cad_offset_m=(0.0, 0.0, 0.0),
-        # cad_rotation_deg=(0.0, 0.0, 0.0),
+        # ---- CAD models ----
+        # "auto" (default) uses models/*.obj, generating them on first run
+        # via generate_cad_models.py. Point these at your own exports
+        # (.obj/.stl/.fbx, meters, +X forward, +Z up) to swap geometry.
+        lander_cad_path="auto",
+        orion_cad_path="auto",
+        cad_scale=1.0,
+        cad_offset_m=(0.0, 0.0, 0.0),
+        cad_rotation_deg=(0.0, 0.0, 0.0),
     )
