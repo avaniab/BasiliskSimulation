@@ -251,13 +251,40 @@ def run(
     oe.omega = NRHO_OMEGA_DEG * macros.D2R
     oe.f = 0.0
 
-    r_target, v_target = orbitalMotion.elem2rv(
-        MU_MOON,
-        oe,
-    )
+    target_mean_motion = np.sqrt(MU_MOON / oe.a**3)
 
-    r_target = np.asarray(r_target, dtype=float).flatten()
-    v_target = np.asarray(v_target, dtype=float).flatten()
+    def target_orbit_state(t_eval):
+        """
+        Kepler-propagate the target NRHO orbit forward from perilune (f=0)
+        at ascent t=0. The previous version computed r_target/v_target ONCE
+        at f=0 and never updated them, so nri/rpod spent the whole mission
+        chasing a target frozen at its position from hours earlier instead
+        of where it actually is by the time ascent gets there.
+        """
+        mean_anomaly = (target_mean_motion * t_eval) % (2.0 * np.pi)
+        ecc_anomaly = mean_anomaly
+        for _ in range(50):
+            delta = (ecc_anomaly - oe.e * np.sin(ecc_anomaly) - mean_anomaly) / (
+                1.0 - oe.e * np.cos(ecc_anomaly)
+            )
+            ecc_anomaly -= delta
+            if abs(delta) < 1e-12:
+                break
+        true_anomaly = 2.0 * np.arctan2(
+            np.sqrt(1.0 + oe.e) * np.sin(ecc_anomaly / 2.0),
+            np.sqrt(1.0 - oe.e) * np.cos(ecc_anomaly / 2.0),
+        )
+        oe_now = orbitalMotion.ClassicElements()
+        oe_now.a = oe.a
+        oe_now.e = oe.e
+        oe_now.i = oe.i
+        oe_now.Omega = oe.Omega
+        oe_now.omega = oe.omega
+        oe_now.f = true_anomaly
+        r_now_target, v_now_target = orbitalMotion.elem2rv(MU_MOON, oe_now)
+        return np.asarray(r_now_target, dtype=float).flatten(), np.asarray(v_now_target, dtype=float).flatten()
+
+    r_target, v_target = target_orbit_state(0.0)
 
     # Orbit-normal of the target NRHO plane. We use this to build a
     # consistent "prograde" tangential direction at ANY position along the
@@ -319,9 +346,9 @@ def run(
     print(f"Mission Timeline: Day 15, Hour 00:00")
     print(f"  Ascent Dry Mass:     {ascent_dry_mass:.1f} kg")
     print(f"  Ascent Wet Mass:     {current_mass:.1f} kg (with propellant)")
-    print(f"  Touchdown Location:  {state['latitude_deg']:.3f}°, {state['longitude_deg']:.3f}°")
+    print(f"  Touchdown Location:  {state['latitude_deg']:.3f} deg, {state['longitude_deg']:.3f} deg")
     print(f"  Target Orbit:        NRHO (Perilune: {NRHO_PERILUNE_RADIUS_M/1e3:.0f} km, Apolune: {NRHO_APOLUNE_RADIUS_M/1e3:.0f} km)")
-    print(f"  Engine Config:       {num_thrusters} thruster(s) × {thrust_N/1000:.1f} kN = {num_thrusters*thrust_N/1000:.1f} kN total")
+    print(f"  Engine Config:       {num_thrusters} thruster(s) x {thrust_N/1000:.1f} kN = {num_thrusters*thrust_N/1000:.1f} kN total")
     print(f"  Specific Impulse:    {isp_s:.0f} sec")
     print("=" * 70 + "\n")
 
@@ -334,7 +361,6 @@ def run(
 
     phase = "liftoff"  # phases: liftoff, circ, loiter, lod, nri, rpod
     circ_start_t = None
-    circ_timeout_s = 20.0 * 60.0
     lod_start_t = None
     lod_timeout_s = 10.0 * 60.0
 
@@ -430,34 +456,8 @@ def run(
         else:
             t_hat_target_plane = np.array([1.0, 0.0, 0.0])
 
-        # Mission phases:
-        # liftoff: pitch-over ascent from surface to ~100 km altitude,
-        #          building tangential (orbital) velocity, not just climbing
-        # circ: at 100 km, circularize into 100 km LLO
-        # loiter: coast in LLO (completed when passing over target again)
-        # lod: escape LLO with LOD burn
-        # nri: approach NRHO and match velocity
-        # rpod: final approach/dock (coast phase)
-
         if phase == "liftoff":
-            # Step 9: Liftoff / gravity-turn burn.
-            #
-            # FIX: the original version thrust purely radially (a_cmd =
-            # -g_vec + 5.0*r_hat) all the way to 100 km altitude. That builds
-            # a huge outward RADIAL velocity but zero tangential (orbital)
-            # velocity. When the circularization phase then tried to match
-            # |v| to the LLO circular speed, it had nothing but radial
-            # velocity to work with, so it just thrust further outward,
-            # canceling gravity and sending the vehicle in a straight line
-            # away from the Moon forever (this is exactly the runaway
-            # altitude climb / crash you were seeing).
-            #
-            # The fix: pitch the thrust vector from vertical (r_hat) toward
-            # horizontal/prograde (t_hat_target_plane) as altitude builds,
-            # so that by the time we reach ~100 km we actually have orbital
-            # (tangential) velocity to circularize with.
             pitch_fraction = min(altitude / liftoff_target_altitude_m, 1.0)
-            # Smooth ease-in pitchover (quarter-sine) rather than a hard switch.
             blend = np.sin(pitch_fraction * np.pi / 2.0)
             thrust_dir = (1.0 - blend) * r_hat + blend * t_hat_target_plane
             thrust_dir_norm = np.linalg.norm(thrust_dir)
@@ -475,21 +475,10 @@ def run(
                 print(f">>> [STEP 10 START] Circularization Burn at 100 km LLO\n")
 
         elif phase == "circ":
-            # Step 10: Circularization Burn - Achieve perfect 100 km circular LLO
-            #
-            # FIX: the original control law only corrected the SCALAR speed
-            # magnitude along whatever direction the vehicle already
-            # happened to be moving (v_needed_dir = v_now / |v_now|). Since
-            # velocity coming out of liftoff was mostly radial, that burn
-            # just kept accelerating radially until |v| matched v_circ, then
-            # (with gravity cancelled) coasted outward forever.
-            #
-            # The fix: decompose velocity into radial and tangential
-            # components explicitly, drive the radial component to zero and
-            # the tangential component to the circular orbital speed. This
-            # is a standard "null the radial rate, match circular tangential
-            # speed" circularization law.
-            v_circ = np.sqrt(MU_MOON / LLO_RADIUS_M)
+            # Target the circular speed at the vehicle's ACTUAL current
+            # radius, not a fixed speed for LLO_RADIUS_M -- liftoff exits on
+            # an altitude threshold, not an exact radius.
+            v_circ_local = np.sqrt(MU_MOON / r_magnitude)
 
             v_radial = np.dot(v_now, r_hat)
             v_radial_vec = v_radial * r_hat
@@ -500,48 +489,40 @@ def run(
             else:
                 t_hat_now = t_hat_target_plane
 
+            # NOTE: no -g_vec term. Basilisk's own gravity model already
+            # applies real gravity to the vehicle regardless of what thrust
+            # is commanded -- adding -g_vec on top of that exactly cancels
+            # gravity's actual curving effect, so once these two correction
+            # terms converge to zero the vehicle just coasts in a straight
+            # line instead of curving into orbit (this was the actual cause
+            # of never converging, not just the timeout). Thrust should only
+            # supply the correction; gravity does the orbit-keeping.
             a_cmd = (
-                -g_vec
                 - 0.5 * v_radial * r_hat
-                + 0.2 * (v_circ - v_tangential_mag) * t_hat_now
+                + 0.2 * (v_circ_local - v_tangential_mag) * t_hat_now
             )
 
-            # FIX: exit condition previously checked h_speed_now < 100.0,
-            # i.e. it demanded the TANGENTIAL speed be near zero, which is
-            # backwards (tangential speed should be near v_circ ~1634 m/s).
-            # It also never checked that the radial speed had actually been
-            # nulled out. Correct condition: radius near LLO target, radial
-            # speed near zero, tangential speed near v_circ. If the vehicle
-            # cannot reach that state within a reasonable window, fall back to
-            # loiter so the mission can continue.
-            circ_elapsed = 0.0 if circ_start_t is None else t - circ_start_t
             circularized = (
-                abs(r_magnitude - LLO_RADIUS_M) < 2.0e3
-                and abs(v_radial) < 5.0
-                and abs(v_tangential_mag - v_circ) < 20.0
+                abs(v_radial) < 5.0
+                and abs(v_tangential_mag - v_circ_local) < 20.0
             )
-            if circularized or circ_elapsed >= circ_timeout_s:
+            if circularized:
                 phase = "loiter"
                 loiter_start_t = t
                 T_LLO = 2.0 * np.pi * np.sqrt(LLO_RADIUS_M**3 / MU_MOON)
-                if circularized:
-                    print(f"\n>>> [STEP 10 COMPLETE] Circularization to 100 km LLO")
-                else:
-                    print(f"\n>>> [STEP 10 COMPLETE] Circularization timeout fallback")
+                print(f"\n>>> [STEP 10 COMPLETE] Circularization to 100 km LLO")
                 print(f"    Time: {t/60:.1f} min | Altitude: {altitude/1000:.1f} km | Speed: {speed:.1f} m/s")
                 print(f"    LLO Period: {T_LLO/60:.1f} min | Mass: {current_mass:.1f} kg")
                 print(f">>> [STEP 11 START] LLO Loiter (3-4 revolutions = ~{2.0*3600/60:.0f} min)\n")
 
         elif phase == "loiter":
-            # Step 11: LLO Loiter - Coast in 100 km LLO for 3-4 revolutions to line up with Orion
             loiter_elapsed = t - loiter_start_t
             T_LLO = 2.0 * np.pi * np.sqrt(LLO_RADIUS_M**3 / MU_MOON)
             revolutions = loiter_elapsed / T_LLO
 
-            # Zero thrust during loiter - natural circular orbit, no propellant consumed
             a_cmd = np.zeros(3)
 
-            if loiter_elapsed >= 2.0 * 3600.0:  # 2 hour loiter (~3.5 revolutions)
+            if loiter_elapsed >= 2.0 * 3600.0:
                 phase = "lod"
                 print(f"\n>>> [STEP 11 COMPLETE] LLO Loiter Phase")
                 print(f"    Time: {t/60:.1f} min | Duration: {loiter_elapsed/3600:.2f} hr ({revolutions:.1f} revolutions)")
@@ -552,10 +533,6 @@ def run(
             if lod_start_t is None:
                 lod_start_t = t
 
-            # Step 12: LOD Acceleration Burn - Depart LLO and climb toward NRHO.
-            # The previous law could stall while waiting for the radius to grow
-            # to a large threshold, so we now force an escape burn and fall back
-            # to the next phase after a reasonable window if it is not yet far enough out.
             v_circ = np.sqrt(MU_MOON / LLO_RADIUS_M)
             v_radial = np.dot(v_now, r_hat)
             v_radial_vec = v_radial * r_hat
@@ -567,15 +544,15 @@ def run(
                 t_hat_now = t_hat_target_plane
 
             target_tangential_speed = 1.25 * v_circ
+            # No -g_vec: same fix as circ. Thrust supplies only the boost;
+            # real gravity (Basilisk) governs the resulting climb.
             a_cmd = (
-                -g_vec
                 - 0.8 * v_radial * r_hat
                 + 0.15 * (target_tangential_speed - v_tangential_mag) * t_hat_now
             )
 
-            # Add a stronger safety brake if the vehicle is descending too fast.
             if altitude < 30.0e3 and v_radial < 0.0:
-                a_cmd = -g_vec - 0.6 * v_radial * r_hat
+                a_cmd = -0.6 * v_radial * r_hat
 
             lod_elapsed = t - lod_start_t
             if r_magnitude >= NRHO_APOLUNE_RADIUS_M * 0.5 or lod_elapsed >= lod_timeout_s:
@@ -586,9 +563,11 @@ def run(
                 print(f">>> [STEP 13 START] NRI Braking Burn (insert into NRHO)\n")
 
         elif phase == "nri":
-            # Step 13: NRI Braking Burn - Match NRHO velocity and position for insertion
-            a_cmd = (-g_vec
-                     + 0.25 * (v_target - v_now)
+            r_target, v_target = target_orbit_state(t)
+            # No -g_vec: real gravity governs the coast; thrust only
+            # supplies the correction toward the (now correctly moving)
+            # target state.
+            a_cmd = (0.25 * (v_target - v_now)
                      + 0.08 * (r_target - r_now) / max(np.linalg.norm(r_target - r_now), 1.0))
 
             v_error = np.linalg.norm(v_target - v_now)
@@ -597,24 +576,22 @@ def run(
                 phase = "rpod"
                 print(f"\n>>> [STEP 13 COMPLETE] NRI Braking Burn")
                 print(f"    Time: {t/60:.1f} min | Velocity Error: {v_error:.1f} m/s | Position Error: {r_error/1000:.1f} km")
-                print(f"    Mass: {current_mass:.1f} kg | Total ΔV used: {total_delta_v:.1f} m/s")
+                print(f"    Mass: {current_mass:.1f} kg | Total delta-v used: {total_delta_v:.1f} m/s")
                 print(f">>> [STEP 14 START] RPOD - Rendezvous, Proximity Operations, Docking\n")
 
         else:  # rpod: coast to rendezvous
-            a_cmd = (-g_vec
-                     + 0.1 * (v_target - v_now))
+            r_target, v_target = target_orbit_state(t)
+            a_cmd = 0.1 * (v_target - v_now)
 
-            # Check if we've successfully reached NRHO
             v_error = np.linalg.norm(v_target - v_now)
             r_error = np.linalg.norm(r_target - r_now)
             if v_error < 10.0 and r_error < 10.0e3:
                 print(f"\n>>> [STEP 14 COMPLETE] RPOD - MISSION SUCCESS!")
                 print(f"    Time: {t/3600:.2f} hr | Velocity Error: {v_error:.2f} m/s | Position Error: {r_error/1000:.1f} km")
-                print(f"    Final Mass: {current_mass:.1f} kg | Total ΔV: {total_delta_v:.1f} m/s")
+                print(f"    Final Mass: {current_mass:.1f} kg | Total delta-v: {total_delta_v:.1f} m/s")
                 print(f"    Docked with Orion at NRHO!\n")
                 break
 
-        # Limit acceleration command rate (jerk limiter)
         max_delta = max_jerk * dt
         delta = a_cmd - a_cmd_previous
         delta_mag = np.linalg.norm(delta)
@@ -622,14 +599,12 @@ def run(
             a_cmd = a_cmd_previous + delta / delta_mag * max_delta
         a_cmd_previous = a_cmd.copy()
 
-        # Apply engine acceleration limit
         a_mag = np.linalg.norm(a_cmd)
         max_engine_accel = (thrust_N * num_thrusters) / max(current_mass, 1e-9)
         if a_mag > max_engine_accel:
             a_cmd = a_cmd / a_mag * max_engine_accel
             a_mag = max_engine_accel
 
-        # Burn propellant and apply force
         burn_propellant(a_mag * dt)
         total_delta_v += a_mag * dt
         ascent_thruster.extForce_N = (current_mass * a_cmd).reshape(3, 1).tolist()
@@ -645,26 +620,25 @@ def run(
         sc_sim.ConfigureStopTime(macros.sec2nano(t))
         sc_sim.ExecuteSimulation()
 
-    # Turn off thrust at the end.
     ascent_thruster.extForce_N = [[0.0], [0.0], [0.0]]
 
     print("=" * 70)
     print("ASCENT MISSION SUMMARY")
     print("=" * 70)
     if phase == "rpod":
-        print(f"✓ MISSION COMPLETE: Successful rendezvous at NRHO")
+        print(f"MISSION COMPLETE: Successful rendezvous at NRHO")
         print(f"  Mission Time:        {t/3600:.2f} hours")
         print(f"  Final Mass:          {current_mass:.1f} kg (dry mass: {ascent_dry_mass:.1f} kg)")
         print(f"  Propellant Used:     {ascent_wet_mass - current_mass:.1f} kg")
-        print(f"  Total ΔV Budget:     {total_delta_v:.1f} m/s")
+        print(f"  Total delta-v Budget: {total_delta_v:.1f} m/s")
         print(f"  Distance to NRHO:    {np.linalg.norm(r_target - r_now)/1000:.1f} km")
         print(f"  Velocity Error:      {np.linalg.norm(v_target - v_now):.2f} m/s")
     else:
         print(
-            f"⚠ MISSION INCOMPLETE: Ended in '{phase.upper()}' phase\n"
+            f"MISSION INCOMPLETE: Ended in '{phase.upper()}' phase\n"
             f"  Mission Time:        {t/3600:.2f} hours\n"
             f"  Final Mass:          {current_mass:.1f} kg\n"
-            f"  Total ΔV Used:       {total_delta_v:.1f} m/s\n"
+            f"  Total delta-v Used:  {total_delta_v:.1f} m/s\n"
             f"  Altitude:            {altitude/1000:.1f} km\n"
             f"  Speed:               {speed:.1f} m/s"
         )
@@ -675,8 +649,6 @@ def run(
         dtype=float,
     )
 
-    # Prevent plotting errors if the recorder contains no samples or
-    # returns a one-dimensional array.
     if position_data.size == 0:
         print(
             "Warning: recorder contained no position samples; "
@@ -814,11 +786,9 @@ if __name__ == "__main__":
         show_plots=True,
         dem_path="LDEM_875S_5M.IMG",
         ascent_mass=4700.0,
-        # Inertia tensor: 9 values in row-major order [I_xx, I_xy, I_xz, I_yx, I_yy, I_yz, I_zx, I_zy, I_zz]
-        # Defaults to diagonal matrix (symmetric with zero off-diagonal terms)
-        ascent_inertia=(1500.0, 0.0, 0.0,    # row 1
-                        0.0, 420.0, 0.0,      # row 2
-                        0.0, 0.0, 300.0),     # row 3
+        ascent_inertia=(1500.0, 0.0, 0.0,
+                        0.0, 420.0, 0.0,
+                        0.0, 0.0, 300.0),
         thrust_N=24500.0,
         num_thrusters=1,
         isp_s=339.0,
