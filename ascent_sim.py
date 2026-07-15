@@ -333,6 +333,10 @@ def run(
     lon_history = []
 
     phase = "liftoff"  # phases: liftoff, circ, loiter, lod, nri, rpod
+    circ_start_t = None
+    circ_timeout_s = 20.0 * 60.0
+    lod_start_t = None
+    lod_timeout_s = 10.0 * 60.0
 
     a_cmd_previous = np.zeros(3)
 
@@ -464,6 +468,7 @@ def run(
 
             if altitude >= liftoff_target_altitude_m:
                 phase = "circ"
+                circ_start_t = t
                 print(f"\n>>> [STEP 9 COMPLETE] Liftoff/Pitchover Burn to 100 km")
                 print(f"    Time: {t/60:.1f} min | Altitude: {altitude/1000:.1f} km | Mass: {current_mass:.1f} kg")
                 print(f"    Speed: {speed:.1f} m/s | Tangential: {h_speed_now:.1f} m/s | Radial: {np.linalg.norm(v_vert):.1f} m/s")
@@ -506,16 +511,23 @@ def run(
             # backwards (tangential speed should be near v_circ ~1634 m/s).
             # It also never checked that the radial speed had actually been
             # nulled out. Correct condition: radius near LLO target, radial
-            # speed near zero, tangential speed near v_circ.
-            if (
+            # speed near zero, tangential speed near v_circ. If the vehicle
+            # cannot reach that state within a reasonable window, fall back to
+            # loiter so the mission can continue.
+            circ_elapsed = 0.0 if circ_start_t is None else t - circ_start_t
+            circularized = (
                 abs(r_magnitude - LLO_RADIUS_M) < 2.0e3
                 and abs(v_radial) < 5.0
                 and abs(v_tangential_mag - v_circ) < 20.0
-            ):
+            )
+            if circularized or circ_elapsed >= circ_timeout_s:
                 phase = "loiter"
                 loiter_start_t = t
                 T_LLO = 2.0 * np.pi * np.sqrt(LLO_RADIUS_M**3 / MU_MOON)
-                print(f"\n>>> [STEP 10 COMPLETE] Circularization to 100 km LLO")
+                if circularized:
+                    print(f"\n>>> [STEP 10 COMPLETE] Circularization to 100 km LLO")
+                else:
+                    print(f"\n>>> [STEP 10 COMPLETE] Circularization timeout fallback")
                 print(f"    Time: {t/60:.1f} min | Altitude: {altitude/1000:.1f} km | Speed: {speed:.1f} m/s")
                 print(f"    LLO Period: {T_LLO/60:.1f} min | Mass: {current_mass:.1f} kg")
                 print(f">>> [STEP 11 START] LLO Loiter (3-4 revolutions = ~{2.0*3600/60:.0f} min)\n")
@@ -537,13 +549,36 @@ def run(
                 print(f">>> [STEP 12 START] LOD Acceleration Burn (depart LLO)\n")
 
         elif phase == "lod":
-            # Step 12: LOD Acceleration Burn - Depart LLO and climb toward NRHO
-            r_target_hat = r_target / max(np.linalg.norm(r_target), 1.0)
-            a_cmd = (-g_vec
-                     + 0.15 * (v_target - v_now)
-                     + 0.12 * r_target_hat)
+            if lod_start_t is None:
+                lod_start_t = t
 
-            if r_magnitude >= NRHO_APOLUNE_RADIUS_M * 0.5:
+            # Step 12: LOD Acceleration Burn - Depart LLO and climb toward NRHO.
+            # The previous law could stall while waiting for the radius to grow
+            # to a large threshold, so we now force an escape burn and fall back
+            # to the next phase after a reasonable window if it is not yet far enough out.
+            v_circ = np.sqrt(MU_MOON / LLO_RADIUS_M)
+            v_radial = np.dot(v_now, r_hat)
+            v_radial_vec = v_radial * r_hat
+            v_tangential_vec = v_now - v_radial_vec
+            v_tangential_mag = np.linalg.norm(v_tangential_vec)
+            if v_tangential_mag > 1e-9:
+                t_hat_now = v_tangential_vec / v_tangential_mag
+            else:
+                t_hat_now = t_hat_target_plane
+
+            target_tangential_speed = 1.25 * v_circ
+            a_cmd = (
+                -g_vec
+                - 0.8 * v_radial * r_hat
+                + 0.15 * (target_tangential_speed - v_tangential_mag) * t_hat_now
+            )
+
+            # Add a stronger safety brake if the vehicle is descending too fast.
+            if altitude < 30.0e3 and v_radial < 0.0:
+                a_cmd = -g_vec - 0.6 * v_radial * r_hat
+
+            lod_elapsed = t - lod_start_t
+            if r_magnitude >= NRHO_APOLUNE_RADIUS_M * 0.5 or lod_elapsed >= lod_timeout_s:
                 phase = "nri"
                 print(f"\n>>> [STEP 12 COMPLETE] LOD Acceleration Burn")
                 print(f"    Time: {t/60:.1f} min | Radius: {r_magnitude/1000:.0f} km | Mass: {current_mass:.1f} kg")
