@@ -2,36 +2,50 @@
 # produced by descent_sim.py and uses the remaining mass as the ascent-stage
 # propellant budget.
 #
-# REWORKED GUIDANCE (why the old version never reached NRHO):
+# ============================ GUIDANCE REWORK ============================
+# Why the old version never reached NRHO:
 #
 #   1. LOD phase deadlock: the control law servoed toward r_target -- the
 #      NRHO *perilune* point at r = 3,366 km -- but the phase exit gate
-#      waited for r >= 0.5 * APOLUNE = 35,500 km. The vehicle was pulled
-#      toward a point 32,000 km inside the gate, so the phase never exited
-#      and burned propellant (gravity cancellation) until depletion.
+#      waited for r >= 0.5 * APOLUNE = 35,500 km. Unreachable gate; the
+#      phase hung, gravity-canceling until propellant depletion.
+#   2. Circ phase deadlock: exit gate required |r - LLO_RADIUS| < 2 km but
+#      the law had no radial-position feedback.
+#   3. Gravity cancellation everywhere: hover-thrusting through multi-hour
+#      phases costs tens of km/s of delta-V.
 #
-#   2. Circ phase deadlock: the exit gate required |r - LLO_RADIUS| < 2 km,
-#      but the control law had no radial *position* feedback -- it only
-#      damped radial rate. Null the radial rate 5 km off the target radius
-#      and the gate never trips.
+# The rework uses a standard burn + coast architecture:
+#   liftoff -> circ -> loiter -> lod (prograde burn) -> transfer (coast)
+#   -> nri (velocity-match burn) -> element-based success check.
 #
-#   3. Gravity cancellation everywhere: every powered phase commanded
-#      -g_vec continuously. Hover-thrusting through a multi-hour transfer
-#      costs tens of km/s of delta-V; no realistic wet/dry ratio survives.
+# ========================= VIZARD VISUALIZATION =========================
+# The sim streams/records a full Vizard scene:
+#   * The ascent lander AND an "OrionNRHO" target vehicle propagating the
+#     NRHO ellipse, so the rendezvous geometry is visible end to end.
+#   * A location pin on the lunar surface at the touchdown site.
+#   * True (flown) trajectory lines, labels, and preset cameras.
+#   * viz_mode selects the output:
+#       "file"  - record a playback file:  _VizFiles/<name>_UnityViz.bin
+#                 (open it in Vizard: File > Load; Vizard download:
+#                  https://hanspeterschaub.info/basilisk/Vizard/Vizard.html)
+#       "live"  - 2-way live stream; start Vizard FIRST and connect in
+#                 "Live Display" mode, else the sim waits for a connection
+#       "both"  - record and stream simultaneously
+#       "off"   - no visualization
 #
-# The rework replaces the continuous force-servo phases with a standard
-# burn + coast architecture:
-#
-#   liftoff  - pitch-over ascent (unchanged; it worked)
-#   circ     - circularize at the achieved radius (rate + speed feedback,
-#              no gravity cancellation, gate is achievable)
-#   loiter   - 2 h zero-thrust coast in LLO
-#   lod      - finite prograde burn to raise apoapsis to NRHO perilune
-#              radius (Hohmann-style), then cut thrust
-#   transfer - zero-thrust coast up the transfer ellipse (~100 min)
-#   nri      - finite burn near apoapsis to match NRHO perilune velocity
-#   success  - verified from achieved orbital elements (rp/ra/plane), not
-#              distance to a static point Orion wouldn't actually be at
+# ============================ CAD MODEL HOOK ============================
+# Custom CAD geometry is plumbed through but OFF by default. When you have
+# a model ready (e.g. exported from Fusion 360 / SolidWorks as .obj with
+# units in meters, +X forward, +Z up), just pass:
+#     lander_cad_path="models/ascent_stage.obj"
+#     orion_cad_path="models/orion.obj"
+# and optionally cad_scale / cad_offset_m / cad_rotation_deg. The hook uses
+# vizSupport.createCustomModel(), so .obj/.stl/.fbx and Unity primitive
+# names ("CUBE", "CYLINDER", "SPHERE", ...) all work. Until then, Vizard's
+# built-in spacecraft model is used. Every viz feature is wrapped
+# defensively: if your Basilisk build lacks a feature (or vizInterface
+# entirely), the sim still runs and just prints a [viz] note.
+# ========================================================================
 import json
 import os
 import matplotlib.pyplot as plt
@@ -63,6 +77,18 @@ NRHO_INCLINATION_DEG = 90.0
 NRHO_OMEGA_DEG = 90.0
 
 LLO_RADIUS_M = MEAN_RADIUS_M + 100.0e3
+
+ORION_MASS_KG = 26520.0
+
+# Colors used for the phase shading in the summary plots.
+PHASE_COLORS = {
+    "liftoff": "#ffd9b3",
+    "circ": "#ffe9a8",
+    "loiter": "#d6f5d6",
+    "lod": "#ffc4c4",
+    "transfer": "#cfe8ff",
+    "nri": "#e6ccff",
+}
 
 
 def load_touchdown_state(state_path):
@@ -109,6 +135,142 @@ def build_fallback_state(ascent_mass):
     }
 
 
+def setup_visualization(
+    sc_sim,
+    sim_task_name,
+    sc_list,
+    moon_body,
+    viz_mode,
+    viz_file_name,
+    landing_site_r_P,
+    lander_tag,
+    cad_models,
+):
+    """Create the Vizard scene. Returns the viz instance or None.
+
+    Every optional feature is wrapped in try/except so version drift in
+    Basilisk's vizSupport API (or a build without vizInterface) can never
+    take down the simulation itself.
+    """
+    if viz_mode == "off":
+        print("[viz] Vizard output disabled (viz_mode='off').")
+        return None
+    if not getattr(vizSupport, "vizFound", True):
+        print("[viz] This Basilisk build has no vizInterface; skipping Vizard output.")
+        return None
+    viz_kwargs = {}
+    if viz_mode in ("file", "both"):
+        viz_kwargs["saveFile"] = viz_file_name
+    if viz_mode in ("live", "both"):
+        viz_kwargs["liveStream"] = True
+        print("[viz] Live streaming enabled -- start Vizard and connect in "
+              "'Live Display' mode before/when the sim starts.")
+    try:
+        viz = vizSupport.enableUnityVisualization(
+            sc_sim,
+            sim_task_name,
+            sc_list,
+            **viz_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 - never let viz kill the sim
+        print(f"[viz] enableUnityVisualization failed ({exc}); continuing without Vizard.")
+        return None
+    if viz is None:
+        print("[viz] vizInterface unavailable; continuing without Vizard.")
+        return None
+
+    # --- Scene settings -------------------------------------------------
+    try:
+        viz.settings.trueTrajectoryLinesOn = 1   # draw the actual flown path
+        viz.settings.orbitLinesOn = 1            # osculating orbit lines
+        viz.settings.showSpacecraftLabels = 1
+        viz.settings.showCelestialBodyLabels = 1
+        viz.settings.mainCameraTarget = lander_tag
+        viz.settings.spacecraftSizeMultiplier = 2.0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[viz] could not apply scene settings ({exc}).")
+
+    # --- Landing-site location pin ---------------------------------------
+    # r_GP_P is the site position in the Moon-fixed frame; at t=0 the
+    # inertial and Moon-fixed frames coincide in this sim.
+    for parent_name in ("moon",
+                        getattr(moon_body, "displayName", "") or "",
+                        getattr(moon_body, "planetName", "") or ""):
+        if not parent_name:
+            continue
+        try:
+            vizSupport.addLocation(
+                viz,
+                stationName="Touchdown Site",
+                parentBodyName=parent_name,
+                r_GP_P=list(np.asarray(landing_site_r_P, dtype=float)),
+                fieldOfView=np.radians(170.0),
+                color="red",
+                range=2000.0e3,
+            )
+            print(f"[viz] landing-site marker added (parent body '{parent_name}').")
+            break
+        except Exception:  # noqa: BLE001 - try the next candidate name
+            continue
+    else:
+        print("[viz] could not add the landing-site marker; continuing.")
+
+    # --- Preset cameras ---------------------------------------------------
+    try:
+        # Wide shot keeping the Moon in frame.
+        vizSupport.createStandardCamera(
+            viz,
+            setMode=0,
+            bodyTarget="moon",
+            setView=0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[viz] moon camera not created ({exc}).")
+    try:
+        # Nadir-looking camera riding on the lander.
+        vizSupport.createStandardCamera(
+            viz,
+            setMode=1,
+            spacecraftName=lander_tag,
+            displayName="LanderNadirCam",
+            fieldOfView=np.radians(70.0),
+            pointingVector_B=[0.0, 0.0, -1.0],
+            position_B=[0.0, 0.0, 2.0],
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[viz] lander camera not created ({exc}).")
+
+    # --- CAD models (optional) --------------------------------------------
+    # Each entry: {"path", "bodies", "scale", "offset_m", "rotation_deg"}.
+    # Accepts .obj/.stl/.fbx paths or Unity primitives ("CUBE", ...).
+    for model in cad_models:
+        path = model.get("path")
+        if not path:
+            continue
+        is_primitive = str(path).isupper() and "." not in str(path)
+        if not is_primitive and not os.path.exists(path):
+            print(f"[viz] CAD model not found at '{path}'; using default geometry.")
+            continue
+        try:
+            scale = float(model.get("scale", 1.0))
+            vizSupport.createCustomModel(
+                viz,
+                modelPath=str(path),
+                simBodiesToModify=list(model.get("bodies", [])),
+                scale=[scale, scale, scale],
+                offset=list(model.get("offset_m", (0.0, 0.0, 0.0))),
+                rotation=list(np.radians(model.get("rotation_deg", (0.0, 0.0, 0.0)))),
+            )
+            print(f"[viz] CAD model '{path}' attached to {model.get('bodies')}.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viz] could not attach CAD model '{path}' ({exc}).")
+
+    if viz_mode in ("file", "both"):
+        print(f"[viz] recording playback file: look for "
+              f"'_VizFiles/{viz_file_name}_UnityViz.bin' next to this script.")
+    return viz
+
+
 def run(
     show_plots,
     dem_path,
@@ -122,12 +284,24 @@ def run(
     max_jerk,
     blend_duration_s,  # retained for signature compatibility (unused)
     state_path=None,
+    # ------------- visualization options -------------
+    viz_mode="file",          # "file" | "live" | "both" | "off"
+    viz_file_name=None,       # defaults to this script's name
+    show_orion_target=True,   # add Orion propagating the NRHO for context
+    # ------------- CAD hooks (leave None until models exist) -------------
+    lander_cad_path=None,     # e.g. "models/ascent_stage.obj" or "CYLINDER"
+    orion_cad_path=None,      # e.g. "models/orion.obj"
+    cad_scale=1.0,
+    cad_offset_m=(0.0, 0.0, 0.0),
+    cad_rotation_deg=(0.0, 0.0, 0.0),
 ):
     if state_path is None:
         state_path = os.path.join(
             os.path.dirname(__file__),
             "descent_state.json",
         )
+    if viz_file_name is None:
+        viz_file_name = fileName
     config = load_config()
     ascent_cfg = config.get("mission", {}).get("stages", {}).get("ascent", {})
     if not ascent_cfg:
@@ -234,17 +408,18 @@ def run(
     moon = grav_factory.createMoon()
     moon.isCentralBody = True
     moon.mu = MU_MOON
+    grav_bodies = spacecraft.GravBodyVector(
+        list(grav_factory.gravBodies.values())
+    )
     lander = spacecraft.Spacecraft()
     lander.ModelTag = "ascentLander"
     lander.hub.mHub = current_mass
     lander.hub.r_BcB_B = [[0.0], [0.0], [0.0]]
-    # FIX: Basilisk.utilities has no `simHelpers` module; build the 3x3
+    # NOTE: Basilisk.utilities has no `simHelpers` module; build the 3x3
     # inertia matrix directly from the 9 row-major values.
     inertia = list(ascent_inertia)
     lander.hub.IHubPntBc_B = [inertia[0:3], inertia[3:6], inertia[6:9]]
-    lander.gravField.gravBodies = spacecraft.GravBodyVector(
-        list(grav_factory.gravBodies.values())
-    )
+    lander.gravField.gravBodies = grav_bodies
     sc_sim.AddModelToTask(
         sim_task_name,
         lander,
@@ -257,11 +432,8 @@ def run(
     sc_sim.AddModelToTask(sim_task_name, ascent_thruster)
 
     # Representative two-body ellipse with NRHO-like perilune and apolune.
-    # Used only to define the target orbital PLANE and target elements;
-    # success is judged on achieved elements, not on reaching a static
-    # point (the old r_error/v_error-to-a-frozen-perilune criterion could
-    # not be met without phasing control and is not what "reached NRHO"
-    # means anyway).
+    # Defines the target orbital PLANE and elements; success is judged on
+    # achieved elements, not on reaching a static point.
     oe = orbitalMotion.ClassicElements()
     oe.a = NRHO_SMA_M
     oe.e = (
@@ -288,6 +460,28 @@ def run(
     else:
         h_target_hat = h_target / h_target_norm
 
+    # --- Orion target vehicle on the NRHO (visual + range reference) -----
+    # A second spacecraft propagating the target ellipse ballistically, so
+    # Vizard shows both vehicles and the rendezvous geometry, and the sim
+    # can report range-to-Orion.
+    orion = None
+    if show_orion_target:
+        orion = spacecraft.Spacecraft()
+        orion.ModelTag = "OrionNRHO"
+        orion.hub.mHub = ORION_MASS_KG
+        orion.hub.r_BcB_B = [[0.0], [0.0], [0.0]]
+        orion.hub.IHubPntBc_B = [
+            [9.0e5, 0.0, 0.0],
+            [0.0, 9.0e5, 0.0],
+            [0.0, 0.0, 9.0e5],
+        ]
+        orion.gravField.gravBodies = grav_bodies
+        orion.hub.r_CN_NInit = r_target.reshape(3, 1).tolist()
+        orion.hub.v_CN_NInit = v_target.reshape(3, 1).tolist()
+        orion.hub.sigma_BNInit = [[0.0], [0.0], [0.0]]
+        orion.hub.omega_BN_BInit = [[0.0], [0.0], [0.0]]
+        sc_sim.AddModelToTask(sim_task_name, orion, None, 1)
+
     lander.hub.r_CN_NInit = r0.reshape(3, 1).tolist()
     lander.hub.v_CN_NInit = v0.reshape(3, 1).tolist()
     lander.hub.sigma_BNInit = [[0.0], [0.0], [0.0]]
@@ -295,12 +489,42 @@ def run(
     sampling_time = macros.sec2nano(2.0)
     lander_recorder = lander.scStateOutMsg.recorder(sampling_time)
     sc_sim.AddModelToTask(sim_task_name, lander_recorder)
-    vizSupport.enableUnityVisualization(
+    orion_recorder = None
+    if orion is not None:
+        orion_recorder = orion.scStateOutMsg.recorder(sampling_time)
+        sc_sim.AddModelToTask(sim_task_name, orion_recorder)
+
+    # --- Vizard scene ------------------------------------------------------
+    cad_models = []
+    if lander_cad_path:
+        cad_models.append({
+            "path": lander_cad_path,
+            "bodies": [lander.ModelTag],
+            "scale": cad_scale,
+            "offset_m": cad_offset_m,
+            "rotation_deg": cad_rotation_deg,
+        })
+    if orion_cad_path and orion is not None:
+        cad_models.append({
+            "path": orion_cad_path,
+            "bodies": [orion.ModelTag],
+            "scale": cad_scale,
+            "offset_m": cad_offset_m,
+            "rotation_deg": cad_rotation_deg,
+        })
+    sc_list = [lander] if orion is None else [lander, orion]
+    setup_visualization(
         sc_sim,
         sim_task_name,
-        lander,
-        saveFile=fileName,
+        sc_list,
+        moon,
+        viz_mode,
+        viz_file_name,
+        landing_site_r_P=r0,
+        lander_tag=lander.ModelTag,
+        cad_models=cad_models,
     )
+
     sc_sim.InitializeSimulation()
     sc_sim.SetProgressBar(False)
 
@@ -322,6 +546,11 @@ def run(
     velocity_ref = lander.dynManager.getStateObject(
         lander.hub.nameOfHubVelocity
     )
+    orion_position_ref = None
+    if orion is not None:
+        orion_position_ref = orion.dynManager.getStateObject(
+            orion.hub.nameOfHubPosition
+        )
     t = 0.0
     last_print = -print_interval_s
     print("\n" + "=" * 70)
@@ -334,6 +563,8 @@ def run(
     print(f"  Target Orbit:        NRHO (Perilune: {NRHO_PERILUNE_RADIUS_M/1e3:.0f} km, Apolune: {NRHO_APOLUNE_RADIUS_M/1e3:.0f} km)")
     print(f"  Engine Config:       {num_thrusters} thruster(s) × {thrust_N/1000:.1f} kN = {num_thrusters*thrust_N/1000:.1f} kN total")
     print(f"  Specific Impulse:    {isp_s:.0f} sec")
+    if orion is not None:
+        print(f"  Target Vehicle:      OrionNRHO ({ORION_MASS_KG:.0f} kg) propagating the NRHO")
     print("=" * 70 + "\n")
 
     altitude_history = []
@@ -342,6 +573,7 @@ def run(
     mass_history = []
     lat_history = []
     lon_history = []
+    orion_range_history = []
     # phases: liftoff, circ, loiter, lod, transfer, nri
     phase = "liftoff"
     phase_numbers = {
@@ -352,6 +584,7 @@ def run(
         "transfer": 12,
         "nri": 13,
     }
+    phase_events = [(0.0, "liftoff")]  # (start time, phase) for plot shading
     a_cmd_previous = np.zeros(3)
     total_delta_v = 0.0
     mission_success = False
@@ -361,7 +594,9 @@ def run(
     liftoff_target_altitude_m = 100.0e3
     loiter_start_t = 0.0
     loiter_duration_s = 2.0 * 3600.0
-    # FIX: initialize summary variables so the post-loop report cannot hit
+    min_orion_range = np.inf
+    min_orion_range_t = 0.0
+    # Initialize summary variables so the post-loop report cannot hit
     # unbound locals if the loop body never runs (e.g. zero propellant).
     altitude = 0.0
     speed = np.linalg.norm(v0)
@@ -370,6 +605,11 @@ def run(
     # 10 hour max duration for the entire ascent (transfer to the NRHO
     # perilune radius is only ~100 min, so this is generous).
     t_stop = 10.0 * 3600.0
+
+    def switch_phase(new_phase):
+        nonlocal phase
+        phase = new_phase
+        phase_events.append((t, new_phase))
 
     while t < t_stop and current_mass > ascent_dry_mass + 1e-6:
         r_now = np.asarray(
@@ -388,6 +628,17 @@ def run(
             print("Invalid spacecraft position magnitude.")
             break
         r_hat = r_now / r_magnitude
+        orion_range = np.nan
+        if orion_position_ref is not None:
+            orion_r = np.asarray(
+                orion_position_ref.getState(),
+                dtype=float,
+            ).flatten()
+            if orion_r.size == 3:
+                orion_range = np.linalg.norm(orion_r - r_now)
+                if orion_range < min_orion_range:
+                    min_orion_range = orion_range
+                    min_orion_range_t = t
         # Account for lunar rotation when querying the DEM
         local_radius, latitude_deg, longitude_deg, source = get_local_radius(
             r_now,
@@ -419,13 +670,16 @@ def run(
         if t - last_print >= print_interval_s:
             propellant_remaining = max(current_mass - ascent_dry_mass, 0.0)
             phase_num = phase_numbers.get(phase, 0)
+            range_txt = ""
+            if np.isfinite(orion_range):
+                range_txt = f" | Orion rng={orion_range/1000.0:8.0f} km"
             print(
                 f"[Step {phase_num:2d}] t={t / 60.0:7.1f} min | "
                 f"alt={altitude / 1000.0:7.2f} km | "
                 f"speed={speed:7.1f} m/s | "
                 f"mass={current_mass:8.1f} kg | "
                 f"prop={propellant_remaining:7.1f} kg | "
-                f"{phase.upper()}"
+                f"{phase.upper()}{range_txt}"
             )
             last_print = t
         g_vec = -MU_MOON * r_now / r_magnitude**3
@@ -451,23 +705,14 @@ def run(
                 thrust_dir = thrust_dir / thrust_dir_norm
             a_cmd = -g_vec + 5.0 * thrust_dir
             if altitude >= liftoff_target_altitude_m:
-                phase = "circ"
+                switch_phase("circ")
                 print(f"\n>>> [STEP 9 COMPLETE] Liftoff/Pitchover Burn to 100 km")
                 print(f"    Time: {t/60:.1f} min | Altitude: {altitude/1000:.1f} km | Mass: {current_mass:.1f} kg")
                 print(f"    Speed: {speed:.1f} m/s | Tangential: {h_speed_now:.1f} m/s | Radial: {np.linalg.norm(v_vert):.1f} m/s")
                 print(f">>> [STEP 10 START] Circularization Burn (~100 km LLO)\n")
         elif phase == "circ":
-            # Step 10: Circularize at the CURRENT radius.
-            #
-            # FIX (deadlock): the old gate demanded |r - LLO_RADIUS| < 2 km
-            # but the law had no radial-position feedback, so the radius
-            # could settle a few km off the target and the gate never
-            # tripped. Circularizing at the achieved radius is what a real
-            # ascent does; the exact LLO altitude is unimportant.
-            #
-            # FIX (efficiency): no -g_vec term. Once tangential speed is
-            # circular, gravity IS the centripetal force; canceling it
-            # would push the vehicle outward and waste propellant.
+            # Step 10: Circularize at the CURRENT radius. Rate + speed
+            # feedback only -- no gravity cancellation, achievable gate.
             v_circ_local = np.sqrt(MU_MOON / r_magnitude)
             if h_speed_now > 1e-9:
                 t_hat_now = v_horiz / h_speed_now
@@ -478,7 +723,7 @@ def run(
                 + 0.5 * (v_circ_local - h_speed_now) * t_hat_now
             )
             if abs(v_radial) < 2.0 and abs(h_speed_now - v_circ_local) < 5.0:
-                phase = "loiter"
+                switch_phase("loiter")
                 loiter_start_t = t
                 T_LLO = 2.0 * np.pi * np.sqrt(r_magnitude**3 / MU_MOON)
                 print(f"\n>>> [STEP 10 COMPLETE] Circularization at {altitude/1000:.1f} km LLO")
@@ -490,7 +735,7 @@ def run(
             loiter_elapsed = t - loiter_start_t
             a_cmd = np.zeros(3)
             if loiter_elapsed >= loiter_duration_s:
-                phase = "lod"
+                switch_phase("lod")
                 T_LLO = 2.0 * np.pi * np.sqrt(r_magnitude**3 / MU_MOON)
                 print(f"\n>>> [STEP 11 COMPLETE] LLO Loiter Phase")
                 print(f"    Time: {t/60:.1f} min | Duration: {loiter_elapsed/3600:.2f} hr ({loiter_elapsed/T_LLO:.1f} revolutions)")
@@ -498,14 +743,7 @@ def run(
                 print(f">>> [STEP 12 START] LOD Burn (raise apoapsis to NRHO perilune radius)\n")
         elif phase == "lod":
             # Step 12: LOD - finite prograde burn to raise apoapsis to the
-            # NRHO perilune radius (3,366 km), i.e. the first half of a
-            # Hohmann transfer. ~225 m/s.
-            #
-            # FIX: the old law servoed toward the perilune POINT while the
-            # exit gate waited at r >= 35,500 km (half the APOLUNE radius).
-            # The gate was unreachable, so the phase hung, gravity-canceling
-            # until propellant depletion. This is the main reason the old
-            # sim never got to NRHO.
+            # NRHO perilune radius (Hohmann first half, ~225 m/s).
             a_transfer = (r_magnitude + NRHO_PERILUNE_RADIUS_M) / 2.0
             v_p_needed = np.sqrt(
                 MU_MOON * (2.0 / r_magnitude - 1.0 / a_transfer)
@@ -513,7 +751,7 @@ def run(
             if speed < v_p_needed - 0.5:
                 a_cmd = 10.0 * (v_now / max(speed, 1e-9))  # clamped to engine max
             else:
-                phase = "transfer"
+                switch_phase("transfer")
                 a_cmd = np.zeros(3)
                 print(f"\n>>> [STEP 12 COMPLETE] LOD Burn")
                 print(f"    Time: {t/60:.1f} min | Speed: {speed:.1f} m/s (needed {v_p_needed:.1f} m/s)")
@@ -526,15 +764,14 @@ def run(
                 r_magnitude >= 0.97 * NRHO_PERILUNE_RADIUS_M
                 or (has_lifted_off and v_radial < -1.0 and r_magnitude > 2.0 * LLO_RADIUS_M)
             ):
-                phase = "nri"
+                switch_phase("nri")
                 print(f"\n>>> [STEP 12b COMPLETE] Transfer Coast")
                 print(f"    Time: {t/60:.1f} min | Radius: {r_magnitude/1000:.0f} km | Speed: {speed:.1f} m/s")
                 print(f">>> [STEP 13 START] NRI Burn (match NRHO velocity at perilune radius)\n")
         elif phase == "nri":
             # Step 13: NRI - finite burn to match the NRHO velocity for the
             # current radius (vis-viva on the target ellipse), directed
-            # prograde in the target plane. ~650 m/s near apoapsis of the
-            # transfer.
+            # prograde in the target plane (~650 m/s near transfer apoapsis).
             v_des_mag_sq = MU_MOON * (2.0 / r_magnitude - 1.0 / NRHO_SMA_M)
             v_des = np.sqrt(max(v_des_mag_sq, 0.0)) * t_hat_target_plane
             dv_vec = v_des - v_now
@@ -558,6 +795,8 @@ def run(
                 print(f"    Achieved perilune: {rp_achieved/1e3:8.0f} km (target {NRHO_PERILUNE_RADIUS_M/1e3:.0f} km) {'OK' if rp_ok else 'OFF'}")
                 print(f"    Achieved apolune:  {ra_achieved/1e3:8.0f} km (target {NRHO_APOLUNE_RADIUS_M/1e3:.0f} km) {'OK' if ra_ok else 'OFF'}")
                 print(f"    Plane alignment:   {plane_alignment:8.4f} (want > 0.99) {'OK' if plane_ok else 'OFF'}")
+                if np.isfinite(orion_range):
+                    print(f"    Range to Orion:    {orion_range/1000.0:8.0f} km (phasing handled during RPOD)")
                 if mission_success:
                     print(f"\n>>> [STEP 14] NRHO INSERTION SUCCESS -- ready for RPOD with Orion")
                     print(f"    Final Mass: {current_mass:.1f} kg | Total ΔV: {total_delta_v:.1f} m/s\n")
@@ -591,6 +830,7 @@ def run(
         mass_history.append(current_mass)
         lat_history.append(latitude_deg)
         lon_history.append(longitude_deg)
+        orion_range_history.append(orion_range)
         t += dt
         sc_sim.ConfigureStopTime(macros.sec2nano(t))
         sc_sim.ExecuteSimulation()
@@ -615,31 +855,30 @@ def run(
             f"  Altitude:            {altitude/1000:.1f} km\n"
             f"  Speed:               {speed:.1f} m/s"
         )
+    if np.isfinite(min_orion_range):
+        print(f"  Closest Orion Range: {min_orion_range/1000.0:.0f} km "
+              f"(at t={min_orion_range_t/3600:.2f} hr)")
+    if viz_mode in ("file", "both"):
+        print(f"  Vizard playback:     _VizFiles/{viz_file_name}_UnityViz.bin")
     print("=" * 70)
 
-    position_data = np.asarray(
-        lander_recorder.r_BN_N,
-        dtype=float,
-    )
-    # Prevent plotting errors if the recorder contains no samples or
-    # returns a one-dimensional array.
-    if position_data.size == 0:
-        print(
-            "Warning: recorder contained no position samples; "
-            "plotting the initial position."
-        )
-        position_data = r0.reshape(1, 3)
-    elif position_data.ndim == 1:
-        if position_data.size == 3:
-            position_data = position_data.reshape(1, 3)
-        elif position_data.size % 3 == 0:
-            position_data = position_data.reshape(-1, 3)
-        else:
-            print(
-                "Warning: unexpected recorder shape "
-                f"{position_data.shape}; plotting initial position."
-            )
-            position_data = r0.reshape(1, 3)
+    def to_position_array(recorder, fallback_r):
+        data = np.asarray(recorder.r_BN_N, dtype=float) if recorder is not None else np.zeros(0)
+        if data.size == 0:
+            return fallback_r.reshape(1, 3)
+        if data.ndim == 1:
+            if data.size == 3:
+                return data.reshape(1, 3)
+            if data.size % 3 == 0:
+                return data.reshape(-1, 3)
+            return fallback_r.reshape(1, 3)
+        return data
+
+    position_data = to_position_array(lander_recorder, r0)
+    orion_position_data = None
+    if orion_recorder is not None:
+        orion_position_data = to_position_array(orion_recorder, r_target)
+
     plt.close("all")
     figure_list = {}
     figure_3d = plt.figure(figsize=(9, 8))
@@ -669,6 +908,15 @@ def run(
         color="orangered",
         label="Ascent Lander",
     )
+    if orion_position_data is not None and orion_position_data.shape[0] > 1:
+        axis_3d.plot3D(
+            orion_position_data[:, 0] / 1000.0,
+            orion_position_data[:, 1] / 1000.0,
+            orion_position_data[:, 2] / 1000.0,
+            color="deepskyblue",
+            linestyle="--",
+            label="Orion (NRHO)",
+        )
     trajectory_limit_km = max(
         NRHO_PERILUNE_RADIUS_M / 1000.0 * 1.3,
         np.max(np.abs(position_data)) / 1000.0 * 1.1,
@@ -692,13 +940,38 @@ def run(
     axis_3d.legend()
     figure_list[fileName + "_3d"] = figure_3d
     if len(time_history) > 1:
+        n_rows = 6 if orion_position_data is not None else 5
         ascent_figure, axes = plt.subplots(
-            5,
+            n_rows,
             1,
-            figsize=(8, 12),
+            figsize=(8, 2.4 * n_rows),
             sharex=True,
         )
         time_hours = np.asarray(time_history) / 3600.0
+        # Phase shading across every panel.
+        span_edges = [event_t / 3600.0 for event_t, _ in phase_events]
+        span_edges.append(time_hours[-1])
+        for axis in axes:
+            for k, (event_t, event_phase) in enumerate(phase_events):
+                axis.axvspan(
+                    span_edges[k],
+                    span_edges[k + 1],
+                    color=PHASE_COLORS.get(event_phase, "#eeeeee"),
+                    alpha=0.35,
+                    zorder=0,
+                )
+        for k, (event_t, event_phase) in enumerate(phase_events):
+            mid = 0.5 * (span_edges[k] + span_edges[k + 1])
+            axes[0].text(
+                mid,
+                0.98,
+                event_phase.upper(),
+                transform=axes[0].get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=7,
+                color="#555555",
+            )
         axes[0].plot(time_hours, np.asarray(altitude_history) / 1000.0, color="orangered")
         axes[0].set_ylabel("Altitude [km]")
         axes[0].grid(True)
@@ -718,9 +991,17 @@ def run(
         axes[4].axhline(100.0, color="green", linestyle="--", label="100 km LLO")
         axes[4].axhline((NRHO_PERILUNE_RADIUS_M - MEAN_RADIUS_M) / 1000.0, color="orange", linestyle="--", label="NRHO perilune altitude")
         axes[4].set_ylabel("Altitude [km]")
-        axes[4].set_xlabel("Time [hr]")
         axes[4].legend()
         axes[4].grid(True)
+        if orion_position_data is not None:
+            axes[5].plot(
+                time_hours,
+                np.asarray(orion_range_history) / 1000.0,
+                color="tab:blue",
+            )
+            axes[5].set_ylabel("Orion range [km]")
+            axes[5].grid(True)
+        axes[-1].set_xlabel("Time [hr]")
         plt.tight_layout()
         figure_list[fileName + "_ascent"] = ascent_figure
     if show_plots:
@@ -747,4 +1028,13 @@ if __name__ == "__main__":
         print_interval_s=30.0,
         max_jerk=4.0,
         blend_duration_s=20.0,
+        # ---- visualization ----
+        viz_mode="file",              # "file" | "live" | "both" | "off"
+        show_orion_target=True,
+        # ---- CAD hooks: uncomment when your models are exported ----
+        # lander_cad_path="models/ascent_stage.obj",
+        # orion_cad_path="models/orion.obj",
+        # cad_scale=1.0,
+        # cad_offset_m=(0.0, 0.0, 0.0),
+        # cad_rotation_deg=(0.0, 0.0, 0.0),
     )
