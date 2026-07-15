@@ -1,0 +1,317 @@
+%General Mission Analysis Tool (GMAT) Script
+%----------------------------------------------------------------------
+% NRHO -> LLO -> DOI -> Powered Descent, lunar south pole landing
+% Converted from a Basilisk (AVS Lab) Python scenario.
+%
+% Units: GMAT works in km, km/s, kg, s. All Basilisk meter values are
+% converted to km below.
+%
+% Conversion notes (what maps 1:1 and what is approximated):
+%   - Burns A/B/C (NRD/LOI transfer, LLO circularization, DOI) were
+%     impulsive velocity resets in Basilisk -> GMAT ImpulsiveBurns with
+%     DecrementMass = true and Isp = 339 s, which reproduces the same
+%     Tsiolkovsky propellant bookkeeping.
+%   - The Basilisk "NRHO" was itself a two-body Keplerian ellipse
+%     (3366 x 71000 km, i = 90 deg, AOP = 90 deg), not a CR3BP halo, so
+%     a Keplerian initial state here is a faithful conversion.
+%   - The closed-loop PDI guidance (range-based ignition, required-
+%     deceleration law, smoothstep blend, jerk limiter) cannot run
+%     inside GMAT's propagator. It is approximated as:
+%       (a) coast to a 20 km ignition altitude (the Basilisk safety
+%           floor min_ignition_altitude_m),
+%       (b) a continuous anti-velocity (VNB -V) finite burn down to
+%           ~50 m/s, which is what the required-decel law converges to,
+%       (c) a bang-bang terminal descent that toggles the same
+%           retro-thruster to keep total speed under ~8 m/s until the
+%           reference surface is reached.
+%   - No DEM terrain: altitude is measured against a 1737.4 km sphere
+%     (Basilisk MEAN_RADIUS_M). Slope / tip-over screening and the
+%     lat/lon terrain lookup have no GMAT equivalent; final Latitude /
+%     Longitude are still reported in the Luna body-fixed frame.
+%   - Luna.Mu is overridden to the Basilisk value 4904.8695 km^3/s^2
+%     (GMAT's default is 4902.8006) so the delta-v numbers match.
+%----------------------------------------------------------------------
+
+%----------------------------------------
+%---------- Solar System / Body Overrides
+%----------------------------------------
+
+GMAT SolarSystem.EphemerisSource = 'DE405';
+GMAT Luna.Mu = 4904.8695;
+GMAT Luna.EquatorialRadius = 1737.4;
+GMAT Luna.Flattening = 0;
+
+%----------------------------------------
+%---------- Coordinate Systems
+%----------------------------------------
+
+Create CoordinateSystem LunaInertial;
+GMAT LunaInertial.Origin = Luna;
+GMAT LunaInertial.Axes = MJ2000Eq;
+
+Create CoordinateSystem LunaFixed;
+GMAT LunaFixed.Origin = Luna;
+GMAT LunaFixed.Axes = BodyFixed;
+
+%----------------------------------------
+%---------- Spacecraft
+%----------------------------------------
+
+Create Spacecraft Lander;
+GMAT Lander.DateFormat = UTCGregorian;
+GMAT Lander.Epoch = '08 Jan 2026 00:00:00.000';
+GMAT Lander.CoordinateSystem = LunaInertial;
+GMAT Lander.DisplayStateType = Keplerian;
+
+% Basilisk step 1: start at NRHO perilune (TA = 0)
+%   rp = 3366 km, ra = 71000 km  ->  SMA = 37183 km, ECC = 0.9094748
+GMAT Lander.SMA = 37183;
+GMAT Lander.ECC = 0.9094748;
+GMAT Lander.INC = 90;
+GMAT Lander.RAAN = 0;
+GMAT Lander.AOP = 90;
+GMAT Lander.TA = 0;
+
+% Basilisk: dry 5300 kg, wet 19300 kg -> 14000 kg propellant
+GMAT Lander.DryMass = 5300;
+GMAT Lander.Cd = 2.2;
+GMAT Lander.Cr = 1.8;
+GMAT Lander.DragArea = 15;
+GMAT Lander.SRPArea = 15;
+GMAT Lander.Tanks = {DescentTank};
+GMAT Lander.Thrusters = {RetroThruster};
+
+%----------------------------------------
+%---------- Hardware (tank + descent engine)
+%----------------------------------------
+
+Create ChemicalTank DescentTank;
+GMAT DescentTank.AllowNegativeFuelMass = false;
+GMAT DescentTank.FuelMass = 14000;
+GMAT DescentTank.Pressure = 1500;
+GMAT DescentTank.Temperature = 20;
+GMAT DescentTank.RefTemperature = 20;
+GMAT DescentTank.Volume = 12;
+GMAT DescentTank.FuelDensity = 1260;
+GMAT DescentTank.PressureModel = PressureRegulated;
+
+% Basilisk: thrust_N = 24500 x num_thrusters = 2 -> single equivalent
+% 49 kN engine, Isp = 339 s. Thrust direction: anti-velocity in a Luna-
+% centered VNB frame (matches the braking-burn geometry of the guidance
+% law, which pointed the net command mostly against the velocity vector).
+Create ChemicalThruster RetroThruster;
+GMAT RetroThruster.CoordinateSystem = Local;
+GMAT RetroThruster.Origin = Luna;
+GMAT RetroThruster.Axes = VNB;
+GMAT RetroThruster.ThrustDirection1 = -1;
+GMAT RetroThruster.ThrustDirection2 = 0;
+GMAT RetroThruster.ThrustDirection3 = 0;
+GMAT RetroThruster.DutyCycle = 1;
+GMAT RetroThruster.ThrustScaleFactor = 1;
+GMAT RetroThruster.DecrementMass = true;
+GMAT RetroThruster.Tank = {DescentTank};
+GMAT RetroThruster.MixRatio = [1];
+GMAT RetroThruster.GravitationalAccel = 9.80665;
+GMAT RetroThruster.C1 = 49000;
+GMAT RetroThruster.K1 = 339;
+
+%----------------------------------------
+%---------- Burns
+%----------------------------------------
+
+% Burn A: NRD / LOI-style transfer burn at NRHO perilune
+Create ImpulsiveBurn BurnA;
+GMAT BurnA.CoordinateSystem = Local;
+GMAT BurnA.Origin = Luna;
+GMAT BurnA.Axes = VNB;
+GMAT BurnA.Element1 = 0;
+GMAT BurnA.Element2 = 0;
+GMAT BurnA.Element3 = 0;
+GMAT BurnA.DecrementMass = true;
+GMAT BurnA.Tank = {DescentTank};
+GMAT BurnA.Isp = 339;
+GMAT BurnA.GravitationalAccel = 9.80665;
+
+% Burn B: circularize into 100 km LLO
+Create ImpulsiveBurn BurnB;
+GMAT BurnB.CoordinateSystem = Local;
+GMAT BurnB.Origin = Luna;
+GMAT BurnB.Axes = VNB;
+GMAT BurnB.Element1 = 0;
+GMAT BurnB.Element2 = 0;
+GMAT BurnB.Element3 = 0;
+GMAT BurnB.DecrementMass = true;
+GMAT BurnB.Tank = {DescentTank};
+GMAT BurnB.Isp = 339;
+GMAT BurnB.GravitationalAccel = 9.80665;
+
+% Burn C: DOI, lowers perilune to ~15 km
+Create ImpulsiveBurn BurnC;
+GMAT BurnC.CoordinateSystem = Local;
+GMAT BurnC.Origin = Luna;
+GMAT BurnC.Axes = VNB;
+GMAT BurnC.Element1 = 0;
+GMAT BurnC.Element2 = 0;
+GMAT BurnC.Element3 = 0;
+GMAT BurnC.DecrementMass = true;
+GMAT BurnC.Tank = {DescentTank};
+GMAT BurnC.Isp = 339;
+GMAT BurnC.GravitationalAccel = 9.80665;
+
+% PDI / terminal descent finite burn
+Create FiniteBurn PDIBurn;
+GMAT PDIBurn.Thrusters = {RetroThruster};
+
+%----------------------------------------
+%---------- Force Model / Propagators
+%----------------------------------------
+
+% Basilisk used two-body point-mass gravity only; match that here.
+Create ForceModel LunaPointMass;
+GMAT LunaPointMass.CentralBody = Luna;
+GMAT LunaPointMass.PointMasses = {Luna};
+GMAT LunaPointMass.Drag = None;
+GMAT LunaPointMass.SRP = Off;
+GMAT LunaPointMass.RelativisticCorrection = Off;
+GMAT LunaPointMass.ErrorControl = RSSStep;
+
+Create Propagator CoastProp;
+GMAT CoastProp.FM = LunaPointMass;
+GMAT CoastProp.Type = RungeKutta89;
+GMAT CoastProp.InitialStepSize = 10;
+GMAT CoastProp.Accuracy = 1e-12;
+GMAT CoastProp.MinStep = 0.001;
+GMAT CoastProp.MaxStep = 300;
+GMAT CoastProp.MaxStepAttempts = 50;
+
+% Tight step ceiling for the powered descent (Basilisk dt = 0.1 s)
+Create Propagator DescentProp;
+GMAT DescentProp.FM = LunaPointMass;
+GMAT DescentProp.Type = RungeKutta89;
+GMAT DescentProp.InitialStepSize = 0.1;
+GMAT DescentProp.Accuracy = 1e-11;
+GMAT DescentProp.MinStep = 0.0001;
+GMAT DescentProp.MaxStep = 1;
+GMAT DescentProp.MaxStepAttempts = 50;
+
+%----------------------------------------
+%---------- Variables
+%----------------------------------------
+
+Create Variable mu rLLO rPDI r0 v0 a1 a2 dvA dvB dvC;
+Create Variable vCirc TLLO coastB totalDV wetMass;
+
+%----------------------------------------
+%---------- Output
+%----------------------------------------
+
+Create OrbitView MoonView;
+GMAT MoonView.SolverIterations = Current;
+GMAT MoonView.Add = {Lander, Luna};
+GMAT MoonView.CoordinateSystem = LunaInertial;
+GMAT MoonView.DrawObject = [true true];
+GMAT MoonView.ViewPointReference = Luna;
+GMAT MoonView.ViewPointVector = [0 -60000 30000];
+GMAT MoonView.ViewDirection = Luna;
+GMAT MoonView.ViewScaleFactor = 1;
+GMAT MoonView.ViewUpCoordinateSystem = LunaInertial;
+GMAT MoonView.ViewUpAxis = Z;
+GMAT MoonView.ShowPlot = true;
+
+Create ReportFile DescentReport;
+GMAT DescentReport.Filename = 'nrho_south_pole_landing.txt';
+GMAT DescentReport.Add = {Lander.UTCGregorian, Lander.Luna.Altitude, Lander.LunaInertial.VMAG, Lander.TotalMass, Lander.Luna.Latitude, Lander.Luna.Longitude};
+GMAT DescentReport.WriteHeaders = true;
+GMAT DescentReport.WriteReport = true;
+
+Create XYPlot AltitudePlot;
+GMAT AltitudePlot.XVariable = Lander.ElapsedSecs;
+GMAT AltitudePlot.YVariables = {Lander.Luna.Altitude};
+GMAT AltitudePlot.ShowGrid = true;
+GMAT AltitudePlot.ShowPlot = true;
+
+%----------------------------------------
+%---------- Mission Sequence
+%----------------------------------------
+
+BeginMissionSequence;
+
+% Constants (km, km/s). MEAN_RADIUS_M = 1737.4 km;
+% LLO = +100 km, PDI perilune = +15 km.
+GMAT mu   = 4904.8695;
+GMAT rLLO = 1837.4;
+GMAT rPDI = 1752.4;
+GMAT wetMass = Lander.TotalMass;
+GMAT totalDV = 0;
+
+%--- STEP 2: transfer to low lunar orbit -----------------------------
+% Burn A at NRHO perilune: retrograde onto a (3366 x 1837.4 km) transfer
+GMAT r0 = Lander.Luna.RMAG;
+GMAT v0 = Lander.LunaInertial.VMAG;
+GMAT a1 = (r0 + rLLO) / 2;
+GMAT BurnA.Element1 = sqrt(mu*(2/r0 - 1/a1)) - v0;
+Maneuver BurnA(Lander);
+GMAT dvA = BurnA.Element1;
+GMAT totalDV = totalDV + abs(dvA);
+Report DescentReport Lander.UTCGregorian dvA Lander.TotalMass;
+
+% Coast to transfer-orbit periapsis (LLO altitude)
+Propagate CoastProp(Lander) {Lander.Luna.Periapsis};
+
+% Burn B: circularize into the 100 km LLO
+GMAT vCirc = sqrt(mu / rLLO);
+GMAT BurnB.Element1 = vCirc - Lander.LunaInertial.VMAG;
+Maneuver BurnB(Lander);
+GMAT dvB = BurnB.Element1;
+GMAT totalDV = totalDV + abs(dvB);
+Report DescentReport Lander.UTCGregorian dvB Lander.TotalMass;
+
+% LLO loiter: half a circular period for DOI phasing
+% (Basilisk coasted T_LLO / 2 to come back around to the north side)
+GMAT TLLO   = 2 * pi * sqrt(rLLO^3 / mu);
+GMAT coastB = TLLO / 2;
+Propagate CoastProp(Lander) {Lander.ElapsedSecs = coastB};
+
+%--- STEP 3: descent orbit insertion (DOI) ---------------------------
+GMAT a2 = (rLLO + rPDI) / 2;
+GMAT BurnC.Element1 = sqrt(mu*(2/rLLO - 1/a2)) - Lander.LunaInertial.VMAG;
+Maneuver BurnC(Lander);
+GMAT dvC = BurnC.Element1;
+GMAT totalDV = totalDV + abs(dvC);
+Report DescentReport Lander.UTCGregorian dvC Lander.TotalMass;
+
+%--- STEP 3.5: coast to PDI ignition ---------------------------------
+% Basilisk ignited on a range-to-target stopping-distance criterion,
+% with a 20 km minimum-altitude safety floor. The closed-loop range
+% test cannot be evaluated inside a GMAT propagate, so the safety-floor
+% altitude is used as the ignition trigger.
+Propagate CoastProp(Lander) {Lander.Luna.Altitude = 20};
+
+%--- STEPS 4-5: powered braking burn ---------------------------------
+% Continuous anti-velocity finite burn until total speed is ~50 m/s
+% (or the surface intervenes). This stands in for the required-
+% deceleration horizontal law + vertical sink-rate term.
+BeginFiniteBurn PDIBurn(Lander);
+Propagate DescentProp(Lander) {Lander.LunaInertial.VMAG = 0.050, Lander.Luna.Altitude = 0.5};
+EndFiniteBurn PDIBurn(Lander);
+Report DescentReport Lander.UTCGregorian Lander.Luna.Altitude Lander.LunaInertial.VMAG Lander.TotalMass;
+
+%--- STEP 6: terminal descent ----------------------------------------
+% Bang-bang stand-in for the terminal velocity-tracking law
+% (vDesired = k_speed * sqrt(alt)): thrust anti-velocity whenever total
+% speed exceeds ~8 m/s, coast otherwise, in 2 s slices until touchdown
+% at the 1737.4 km reference sphere (5 m floor).
+While Lander.Luna.Altitude > 0.005
+
+   If Lander.LunaInertial.VMAG > 0.008
+      BeginFiniteBurn PDIBurn(Lander);
+      Propagate DescentProp(Lander) {Lander.ElapsedSecs = 2, Lander.Luna.Altitude = 0.005};
+      EndFiniteBurn PDIBurn(Lander);
+   Else
+      Propagate DescentProp(Lander) {Lander.ElapsedSecs = 2, Lander.Luna.Altitude = 0.005};
+   EndIf
+
+EndWhile
+
+%--- Touchdown summary ------------------------------------------------
+Report DescentReport Lander.UTCGregorian Lander.Luna.Altitude Lander.LunaInertial.VMAG Lander.Luna.Latitude Lander.Luna.Longitude Lander.TotalMass totalDV;
